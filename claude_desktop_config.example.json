@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "samsara": {
+      "command": "npx",
+      "args": ["-y", "@automation-squad/mcp-samsara"],
+      "env": {
+        "SAMSARA_API_TOKEN": "YOUR_SAMSARA_API_TOKEN_HERE",
+        "SAMSARA_BASE_URL": "https://api.samsara.com"
+      }
+    }
+  }
+}

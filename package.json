@@ -1,0 +1,36 @@
+{
+  "name": "@automation-squad/mcp-samsara",
+  "version": "1.0.0-beta.1",
+  "description": "Automation Squad MCP for Samsara - Complete fleet management integration with expert knowledge built-in",
+  "type": "module",
+  "bin": {
+    "mcp-samsara": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x build/index.js",
+    "watch": "tsc --watch",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "samsara",
+    "fleet-management",
+    "automation",
+    "claude",
+    "ai-integration",
+    "automation-squad"
+  ],
+  "author": "Automation Squad",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "disclaimer": "⚠️ UNOFFICIAL: This is an unofficial third-party MCP server. Not affiliated with, endorsed by, or sponsored by Samsara Inc. Samsara® is a registered trademark of Samsara Inc. Built using Samsara's public API."
+}

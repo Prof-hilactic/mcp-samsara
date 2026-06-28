@@ -47,33 +47,74 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter();
 
-// API client
-async function samsaraRequest(endpoint: string, options: RequestInit = {}) {
-  await rateLimiter.throttle();
-  
+// Read-only by default: writes/deletes are blocked unless explicitly enabled.
+const ALLOW_WRITES = process.env.SAMSARA_ALLOW_WRITES === "true";
+const WRITE_TOOLS = new Set<string>([
+  "samsara_create_route", "samsara_update_route", "samsara_delete_route",
+  "samsara_optimize_route", "samsara_create_address", "samsara_create_webhook",
+  "samsara_delete_webhook", "samsara_create_contact",
+]);
+
+const MAX_RETRIES = Number(process.env.SAMSARA_MAX_RETRIES ?? 5);
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// Parse Retry-After as either delta-seconds or an HTTP date.
+function retryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const secs = Number(header);
+  if (!Number.isNaN(secs)) return secs * 1000;
+  const date = Date.parse(header);
+  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+}
+
+// API client — bounded exponential backoff + jitter; retries 429/5xx/network errors.
+async function samsaraRequest(endpoint: string, options: RequestInit = {}): Promise<any> {
   const url = `${SAMSARA_BASE_URL}${endpoint}`;
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${SAMSARA_API_TOKEN}`,
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  });
+  let lastErr: unknown;
 
-  if (response.status === 429) {
-    const retryAfter = response.headers.get('Retry-After');
-    const wait = retryAfter ? parseInt(retryAfter) * 1000 : 2000;
-    await new Promise(r => setTimeout(r, wait));
-    return samsaraRequest(endpoint, options);
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    await rateLimiter.throttle();
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          'Authorization': `Bearer ${SAMSARA_API_TOKEN}`,
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
+
+      if (response.ok) {
+        if (response.status === 204) return { success: true };
+        return await response.json();
+      }
+
+      // Retry on rate-limit and transient server errors.
+      if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
+        const explicit = retryAfterMs(response.headers.get('Retry-After'));
+        const backoff = Math.min(30000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
+        await sleep(explicit ?? backoff);
+        continue;
+      }
+
+      const errorBody: any = await response.json().catch(() => ({ message: response.statusText }));
+      throw new Error(`Samsara API error (${response.status}): ${errorBody.message || response.statusText}`);
+    } catch (err) {
+      lastErr = err;
+      // Network/transient error: back off and retry; re-throw API errors immediately.
+      const isApiError = err instanceof Error && err.message.startsWith('Samsara API error');
+      if (isApiError || attempt >= MAX_RETRIES) throw err;
+      await sleep(Math.min(30000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250));
+    }
   }
+  throw lastErr instanceof Error ? lastErr : new Error('Samsara request failed');
+}
 
-  if (!response.ok) {
-    const errorBody: any = await response.json().catch(() => ({ message: response.statusText }));
-    throw new Error(`Samsara API error (${response.status}): ${errorBody.message || response.statusText}`);
-  }
-
-  return response.json();
+// Throw a friendly error if required fields are missing (cheap runtime validation).
+function requireFields(args: Record<string, any>, fields: string[]): void {
+  const missing = fields.filter(f => args[f] === undefined || args[f] === null ||
+    (Array.isArray(args[f]) && args[f].length === 0));
+  if (missing.length) throw new Error(`Missing required field(s): ${missing.join(', ')}`);
 }
 
 // Initialize MCP server
@@ -91,8 +132,7 @@ const server = new Server(
 
 // Tool definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
+  const allTools = [
       // ===== VEHICLE TOOLS =====
       {
         name: "samsara_list_vehicles",
@@ -162,6 +202,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             endTime: {
               type: "string",
               description: "End time in ISO 8601 format"
+            },
+            types: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional Samsara stat types (e.g. fuelPercents, obdOdometerMeters, obdEngineSeconds, gpsOdometerMeters, engineStates, defLevelMilliPercent). Defaults to fuel + odometer + engine hours."
             }
           },
           required: ["vehicleIds", "startTime", "endTime"]
@@ -308,7 +353,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "samsara_optimize_route",
-        description: "Optimize route stop order to minimize distance/time. This is a value-add feature that reorders stops for efficiency while preserving all stop data and IDs.",
+        description: "Propose a better stop order for a route (straight-line nearest-neighbour heuristic). DRY-RUN by default: returns the proposed order WITHOUT changing the route. Set apply=true to write it back. NOTE: this is a heuristic stand-in — real optimisation should come from the road-aware OR-Tools/VROOM service.",
         inputSchema: {
           type: "object",
           properties: {
@@ -318,6 +363,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: ["distance", "time", "fuel"],
               description: "What to optimize for",
               default: "distance"
+            },
+            apply: {
+              type: "boolean",
+              description: "If true, write the optimized order back to the route. Default false (dry-run).",
+              default: false
             }
           },
           required: ["routeId"]
@@ -469,8 +519,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           }
         }
       }
-    ]
-  };
+    ];
+  // Hide write/delete tools unless explicitly enabled (read-only by default).
+  const tools = ALLOW_WRITES ? allTools : allTools.filter(t => !WRITE_TOOLS.has(t.name));
+  return { tools };
 });
 
 // Tool execution
@@ -479,6 +531,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   
   // Ensure args is defined
   const toolArgs = (args || {}) as Record<string, any>;
+
+  // Safety: block writes/deletes unless explicitly enabled.
+  if (WRITE_TOOLS.has(name) && !ALLOW_WRITES) {
+    return {
+      content: [{
+        type: "text",
+        text: `Refused: '${name}' is a write/delete operation and this server is read-only. ` +
+              `Set SAMSARA_ALLOW_WRITES=true to enable write tools.`
+      }],
+      isError: true
+    };
+  }
 
   try {
     switch (name) {
@@ -524,12 +588,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "samsara_get_vehicle_stats": {
+        requireFields(toolArgs, ['vehicleIds', 'startTime', 'endTime']);
+        const types: string[] = Array.isArray(toolArgs.types) && toolArgs.types.length
+          ? toolArgs.types
+          : ['fuelPercents', 'obdOdometerMeters', 'obdEngineSeconds'];
         const params = new URLSearchParams();
         params.set('vehicleIds', toolArgs.vehicleIds.join(','));
         params.set('startTime', toolArgs.startTime);
         params.set('endTime', toolArgs.endTime);
-        params.set('types', 'obdOdometerMeters,obdEngineSeconds,fuelPercents');
-        
+        params.set('types', types.join(','));
+
         const response = await samsaraRequest(`/fleet/vehicles/stats/feed?${params}`);
         return {
           content: [{
@@ -634,23 +702,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Simple nearest-neighbor optimization
+        // Need coordinates on the middle stops to order them; otherwise refuse rather than mis-order.
+        const middle = stops.slice(1, -1);
+        const missingCoords = middle.some((s: any) =>
+          s.address?.latitude == null || s.address?.longitude == null);
+        if (missingCoords) {
+          return {
+            content: [{
+              type: "text",
+              text: "Cannot optimize: one or more stops are missing latitude/longitude. Add coordinates (or use the road-aware optimiser) first."
+            }],
+            isError: true
+          };
+        }
+
+        // Straight-line nearest-neighbour heuristic.
         const optimized = optimizeStops(stops);
-        
-        // Update with optimized order
-        const response = await samsaraRequest(`/fleet/routes/${toolArgs.routeId}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ stops: optimized })
-        });
-        
+        const label = (s: any, i: number) => `${i + 1}. ${s.name || s.address?.formattedAddress}`;
+        const apply = toolArgs.apply === true;
+
+        let applied: any = null;
+        if (apply) {
+          applied = await samsaraRequest(`/fleet/routes/${toolArgs.routeId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ stops: optimized })
+          });
+        }
+
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              message: "Route optimized",
-              originalOrder: stops.map((s: any, i: number) => `${i + 1}. ${s.name || s.address?.formattedAddress}`),
-              optimizedOrder: optimized.map((s: any, i: number) => `${i + 1}. ${s.name || s.address?.formattedAddress}`),
-              data: response
+              message: apply ? "Route optimized and applied" : "Proposed order (dry-run — not applied). Re-call with apply=true to write it.",
+              applied: apply,
+              originalOrder: stops.map(label),
+              optimizedOrder: optimized.map(label),
+              ...(applied ? { data: applied } : {})
             }, null, 2)
           }]
         };
